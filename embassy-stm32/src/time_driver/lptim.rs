@@ -79,7 +79,24 @@ fn icr_write_raw(r: Lptim, val: u32) {
 }
 
 /// Write the compare value and wait for the write to be acknowledged.
-fn write_compare(r: Lptim, val: u16) {
+/// A compare write is pending until the LPTIM acknowledges it with CMPOK.
+static COMPARE_WRITE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Compare values this close to now are waited for: the match could pass
+/// before the write has landed. Anything further away lands in time.
+const COMPARE_WAIT_TICKS: u64 = 8;
+
+/// Write the compare register.
+///
+/// The LPTIM takes a compare write over on its own clock: with a large
+/// prescaler this takes a few counter ticks (about 3 ms at 1024 Hz). Waiting
+/// for every write spends that time busy in the timer interrupt, so the wait
+/// is only done when the caller needs the value to be active now.
+fn write_compare(r: Lptim, val: u16, wait_until_applied: bool) {
+    // A new write while the previous one is still pending is not allowed.
+    if COMPARE_WRITE_PENDING.swap(true, Ordering::Relaxed) {
+        while !r.isr().read().cmpok(0) {}
+    }
     #[cfg(not(any(stm32wba, stm32u5, stm32u3)))]
     {
         // On STM32WL, CMPOK remains set after a compare update. Clear the stale
@@ -88,12 +105,14 @@ fn write_compare(r: Lptim, val: u16) {
         r.icr().write(|w| w.set_cmpokcf(0, true));
 
         r.cmp().write(|w| w.set_cmp(val));
-        while !r.isr().read().cmpok(0) {}
     }
     #[cfg(any(stm32wba, stm32u5, stm32u3))]
     {
         r.ccr(0).write(|w| w.set_ccr(val));
+    }
+    if wait_until_applied {
         while !r.isr().read().cmpok(0) {}
+        COMPARE_WRITE_PENDING.store(false, Ordering::Relaxed);
     }
 }
 
@@ -241,9 +260,15 @@ impl RtcDriver {
             let sr = r.isr().read();
             let ier = ier_read(r);
 
-            // Clear all interrupt flags. Bits in ICR are "write 1 to clear"
-            icr_write_raw(r, ier);
-            icr_write_raw(r, sr.0);
+            // Clear all interrupt flags. Bits in ICR are "write 1 to clear". CMPOK is
+            // left alone: `write_compare` uses it to see that its last write has landed.
+            let cmpok = {
+                let mut bit = stm32_metapac::lptim::regs::Isr(0);
+                bit.set_cmpok(0, true);
+                bit.0
+            };
+            icr_write_raw(r, ier & !cmpok);
+            icr_write_raw(r, sr.0 & !cmpok);
 
             // Overflow
             if sr.ue() {
@@ -308,9 +333,16 @@ impl RtcDriver {
             return false;
         }
 
+        // No alarm pending: just make sure the compare interrupt is off. The
+        // compare register itself need not be written.
+        if timestamp == u64::MAX {
+            ier_set_ccie(r, 0, false);
+            return true;
+        }
+
         // Write the CCR value regardless of whether we're going to enable it now or not.
         // This way, when we enable it later, the right value is already set.
-        write_compare(r, timestamp as u16);
+        write_compare(r, timestamp as u16, timestamp - t <= COMPARE_WAIT_TICKS);
 
         // Enable it if it'll happen this counter cycle. Otherwise, `next_period` will enable it.
         let next_overflow = ((t >> 16) + 1) << 16;
